@@ -12,10 +12,15 @@ var (
 )
 
 type Pool struct {
-	capacity int // workerpool大小
+	capacity int  // workerpool大小
+	preAlloc bool // 是否在创建pool的时候，就预创建workers，默认值为：false
 
+	// 当pool满的情况下，新的Schedule调用是否阻塞当前goroutine。默认值：true
+	// 如果block = false，则Schedule返回ErrNoWorkerAvailInPool
+	block  bool
 	active chan struct{}
-	tasks  chan Task
+
+	tasks chan Task
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -28,7 +33,7 @@ const (
 	maxCapacity     = 10000
 )
 
-func New(capacity int) *Pool {
+func New(capacity int, opts ...Option) *Pool {
 	if capacity <= 0 {
 		capacity = defaultCapacity
 	}
@@ -38,12 +43,25 @@ func New(capacity int) *Pool {
 
 	p := &Pool{
 		capacity: capacity,
+		block:    true,
 		tasks:    make(chan Task),
 		quit:     make(chan struct{}),
 		active:   make(chan struct{}, capacity),
 	}
 
-	fmt.Printf("workerpool start\n")
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	fmt.Printf("workerpool start(preAlloc=%t)\n", p.preAlloc)
+
+	if p.preAlloc {
+		// create all goroutines and send into works channel
+		for i := 0; i < p.capacity; i++ {
+			p.newWorker(i + 1)
+			p.active <- struct{}{}
+		}
+	}
 
 	go p.run()
 
@@ -77,8 +95,30 @@ func (p *Pool) newWorker(i int) {
 	}()
 }
 
+func (p *Pool) returnTask(t Task) {
+	go func() {
+		p.tasks <- t
+	}()
+}
+
 func (p *Pool) run() {
-	idx := 0
+	idx := len(p.active)
+
+	if !p.preAlloc {
+	loop:
+		for t := range p.tasks {
+			p.returnTask(t)
+			select {
+			case <-p.quit:
+				return
+			case p.active <- struct{}{}:
+				idx++
+				p.newWorker(idx)
+			default:
+				break loop
+			}
+		}
+	}
 
 	for {
 		select {
@@ -86,7 +126,6 @@ func (p *Pool) run() {
 			return
 		case p.active <- struct{}{}:
 			// create a new worker
-			fmt.Printf("create a new worker[%03d]\n", idx)
 			idx++
 			p.newWorker(idx)
 		}
@@ -99,14 +138,17 @@ func (p *Pool) Schedule(t Task) error {
 		return ErrWorkerPoolFreed
 	case p.tasks <- t:
 		return nil
+	default:
+		if p.block {
+			p.tasks <- t
+			return nil
+		}
+		return ErrNoIdleWorkerInPool
 	}
 }
 
 func (p *Pool) Free() {
 	close(p.quit) // make sure all worker and p.run exit and schedule return error
 	p.wg.Wait()
-	fmt.Printf("workerpool freed\n")
+	fmt.Printf("workerpool freed(preAlloc=%t)\n", p.preAlloc)
 }
-
-
-
